@@ -1,0 +1,115 @@
+name: Build and publish Windows game
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/release.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: vesper-windows-release
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Get the exact source revision
+        run: |
+          git init .
+          git remote add origin "https://github.com/$env:GITHUB_REPOSITORY.git"
+          git fetch --depth=1 origin $env:GITHUB_SHA
+          git checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Source checkout failed' }
+      - name: Install Godot 4.6.3 and Windows templates
+        run: |
+          $tools = Join-Path $env:RUNNER_TEMP 'vesper-tools'
+          New-Item -ItemType Directory -Force $tools | Out-Null
+          $base = 'https://github.com/godotengine/godot-builds/releases/download/4.6.3-stable'
+          Invoke-WebRequest "$base/Godot_v4.6.3-stable_win64.exe.zip" -OutFile "$tools/editor.zip"
+          Expand-Archive "$tools/editor.zip" "$tools/editor" -Force
+          Invoke-WebRequest "$base/Godot_v4.6.3-stable_export_templates.tpz" -OutFile "$tools/templates.tpz"
+          $templates = Join-Path $env:APPDATA 'Godot/export_templates/4.6.3.stable'
+          New-Item -ItemType Directory -Force $templates | Out-Null
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead("$tools/templates.tpz")
+          foreach ($name in @('windows_release_x86_64.exe','windows_debug_x86_64.exe')) {
+            $entry = $archive.GetEntry("templates/$name")
+            if ($null -eq $entry) { throw "Missing template: $name" }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $templates $name), $true)
+          }
+          $archive.Dispose()
+          Remove-Item "$tools/templates.tpz"
+          Invoke-WebRequest 'https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe' -OutFile "$tools/rcedit.exe"
+          & "$tools/rcedit.exe" "$templates/windows_release_x86_64.exe" --set-icon "$pwd/assets/icon.ico" --set-version-string CompanyName shidikusik --set-version-string ProductName VESPER --set-version-string FileDescription 'VESPER - Song of the Depths' --set-file-version 1.0.1.0 --set-product-version 1.0.1.0
+          if ($LASTEXITCODE -ne 0) { throw 'Windows icon packaging failed' }
+          $godot = Get-ChildItem "$tools/editor" -Filter '*console.exe' | Select-Object -First 1
+          if ($null -eq $godot) { throw 'Godot console executable was not found' }
+          "GODOT_BIN=$($godot.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Import and run the game checks on Windows
+        run: |
+          & $env:GODOT_BIN --headless --path . --editor --import --quit
+          if ($LASTEXITCODE -ne 0) { throw 'Resource import failed' }
+          & $env:GODOT_BIN --headless --path . --script res://tests/integration.gd -- --test
+          if ($LASTEXITCODE -ne 0) { throw 'Gameplay checks failed' }
+          & $env:GODOT_BIN --headless --path . --script res://tests/desktop.gd -- --test
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop controls checks failed' }
+      - name: Export the self-contained Windows EXE
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          & $env:GODOT_BIN --headless --path . --export-release 'Windows Desktop' dist/VESPER.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Windows export failed' }
+          if ((Get-Item dist/VESPER.exe).Length -lt 20000000) { throw 'The exported EXE is unexpectedly small' }
+      - name: Start the exported game on Windows
+        run: |
+          $p = Start-Process -FilePath "$pwd/dist/VESPER.exe" -ArgumentList @('--headless','--audio-driver','Dummy','--quit-after','120','--','--test') -RedirectStandardOutput "$pwd/dist/windows-startup.log" -RedirectStandardError "$pwd/dist/windows-startup-error.log" -PassThru
+          if (-not $p.WaitForExit(60000)) { Stop-Process -Id $p.Id -Force; throw 'Windows game did not exit after the smoke check' }
+          $p.Refresh()
+          Get-Content dist/windows-startup.log -ErrorAction SilentlyContinue
+          Get-Content dist/windows-startup-error.log -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "Windows game exited with code $($p.ExitCode)" }
+          $logs = (Get-Content dist/windows-startup.log,dist/windows-startup-error.log -Raw -ErrorAction SilentlyContinue) -join "`n"
+          if ($logs -match 'SCRIPT ERROR|Failed to load script|Unhandled exception') { throw 'The Windows game reported a runtime error' }
+      - name: Package and publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          @'
+          VESPER - Песнь глубин / Windows x64
+          Распакуй архив и запусти VESPER.exe. Все ресурсы встроены в EXE.
+          A/D: движение. Пробел: прыжок, повторно: двойной прыжок.
+          ЛКМ/J: меч. Shift/ПКМ: рывок. H: лечение. E: фонарь.
+          M: карта. Esc: пауза. F11: полный экран.
+          '@ | Set-Content dist/README_WINDOWS.txt -Encoding utf8
+          Copy-Item LICENSES.txt dist/LICENSES.txt
+          Compress-Archive -Path dist/VESPER.exe,dist/README_WINDOWS.txt,dist/LICENSES.txt -DestinationPath dist/VESPER-Windows-x64.zip -Force
+          $lines = foreach ($file in @('VESPER.exe','VESPER-Windows-x64.zip')) { $hash=(Get-FileHash "dist/$file" -Algorithm SHA256).Hash.ToLower(); "$hash  $file" }
+          $lines | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          $notes = @'
+          Windows-версия VESPER — Песнь глубин.
+
+          Скачай VESPER-Windows-x64.zip, распакуй и запусти VESPER.exe. Или скачай EXE отдельно — все игровые ресурсы уже внутри.
+
+          Управление: A/D — движение, Пробел — прыжок/двойной прыжок, ЛКМ/J — меч, Shift/ПКМ — рывок, H — лечение, E — фонарь, M — карта, Esc — пауза, F11 — полный экран.
+
+          Три области, два типа обычных врагов, финальный босс, фонари и локальные сохранения. Игра полностью офлайн.
+
+          Проверены 25 сценариев механик, 13 проверок управления для ПК и запуск экспортированного EXE на Windows в автоматической проверке. Производительность и графика на физических Windows-ПК отдельно не измерялись.
+          '@
+          $notes | Set-Content dist/RELEASE_NOTES.md -Encoding utf8
+          gh release view v1.0.1 --repo $env:GITHUB_REPOSITORY --json isDraft > dist/existing-release.json 2>$null
+          $exists = $LASTEXITCODE -eq 0
+          if ($exists) {
+            $existing = Get-Content dist/existing-release.json -Raw | ConvertFrom-Json
+            if (-not $existing.isDraft) { throw 'Release v1.0.1 is already published; use a new version tag for a new build' }
+          } else {
+            gh release create v1.0.1 --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title 'VESPER 1.0.1 — Windows' --notes-file dist/RELEASE_NOTES.md --draft
+            if ($LASTEXITCODE -ne 0) { throw 'Release draft creation failed' }
+          }
+          gh release upload v1.0.1 dist/VESPER.exe dist/VESPER-Windows-x64.zip dist/SHA256SUMS.txt --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed' }
+          gh release edit v1.0.1 --repo $env:GITHUB_REPOSITORY --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Publishing the release failed' }
