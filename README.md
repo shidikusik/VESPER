@@ -29,7 +29,7 @@
 
 ## Скриншоты
 
-![VESPER](screenshots/vesper-ruins.png)
+![VESPER для ПК](screenshots/windows.png)
 
 ## Исходный проект
 
