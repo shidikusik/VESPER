@@ -1,0 +1,10 @@
+.godot/
+output/
+*.exe
+*.pck
+*.apk
+*.zip
+*.keystore
+*.jks
+signing/
+export_credentials.cfg
