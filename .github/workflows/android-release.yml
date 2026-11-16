@@ -1,0 +1,90 @@
+name: Add the verified Android APK to the release
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/android-release.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: vesper-android-delivery
+  cancel-in-progress: false
+jobs:
+  publish-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      STAGING_COMMIT: '064c658c1c14ae50a464740cc99a75c08530ec1c'
+      STAGING_BRANCH: 'release-assets/android-064c658c1c14'
+      EXPECTED_SHA256: '838c57fb2a963d841606919ab36acb13d66fff05de4116ac13766279f4bfd5e5'
+    steps:
+      - name: Assemble and verify the original signed APK
+        run: |
+          python3 - <<'PY'
+          import os,json,hashlib,urllib.request,urllib.error,concurrent.futures,shutil,zipfile
+          from pathlib import Path
+          repo=os.environ['GITHUB_REPOSITORY']
+          expected=os.environ['EXPECTED_SHA256']
+          out=Path('dist');out.mkdir(exist_ok=True)
+          apk=out/'VESPER-Android.apk'
+          public=f'https://github.com/{repo}/releases/download/v1.0.1/VESPER-Android.apk'
+          def download(url,path):
+              with urllib.request.urlopen(url,timeout=120) as r,open(path,'wb') as f:
+                  shutil.copyfileobj(r,f)
+          try:
+              download(public,apk)
+              print('Using the Android APK already attached to this release')
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404: raise
+              base=f"https://raw.githubusercontent.com/{repo}/{os.environ['STAGING_COMMIT']}/"
+              with urllib.request.urlopen(base+'manifest.json',timeout=60) as r:
+                  manifest=json.load(r)
+              if manifest['sha256'] != expected: raise RuntimeError('Manifest checksum is unexpected')
+              parts=Path('apk-transfer');parts.mkdir(exist_ok=True)
+              def get_part(item):
+                  target=parts/Path(item['path']).name
+                  download(base+item['path'],target)
+                  data=target.read_bytes()
+                  if len(data)!=item['size'] or hashlib.sha256(data).hexdigest()!=item['sha256']:
+                      raise RuntimeError('An Android transfer block failed its checksum')
+                  return target
+              with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                  downloaded=list(pool.map(get_part,manifest['parts']))
+              with apk.open('wb') as f:
+                  for p in downloaded:
+                      with p.open('rb') as src: shutil.copyfileobj(src,f)
+              if apk.stat().st_size != manifest['size']: raise RuntimeError('APK size mismatch')
+          digest=hashlib.sha256(apk.read_bytes()).hexdigest()
+          if digest != expected: raise RuntimeError('Final APK checksum mismatch')
+          with zipfile.ZipFile(apk) as z:
+              if z.testzip() is not None: raise RuntimeError('APK archive verification failed')
+              if 'AndroidManifest.xml' not in z.namelist(): raise RuntimeError('This is not an Android package')
+          (out/'SHA256SUMS-Android.txt').write_text(digest+'  VESPER-Android.apk\n',encoding='ascii')
+          print('Verified original signed APK:',apk.stat().st_size,'bytes, SHA256',digest)
+          PY
+      - name: Attach APK and checksum to the existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view v1.0.1 --repo "$GITHUB_REPOSITORY" --json assets > existing-assets.json
+          for file in VESPER-Android.apk SHA256SUMS-Android.txt; do
+            if jq -e --arg name "$file" '.assets[] | select(.name == $name)' existing-assets.json >/dev/null; then
+              echo "Already attached: $file"
+            else
+              gh release upload v1.0.1 "dist/$file" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
+          gh release view v1.0.1 --repo "$GITHUB_REPOSITORY" --json body --jq .body > release-notes.md
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('release-notes.md');body=p.read_text()
+          if '## Android' not in body:
+              body+='\n\n## Android\n\nДобавлена проверенная Android-версия 1.0.0: **VESPER-Android.apk** (около 84 МБ). Это исходный подписанный APK; его SHA-256 полностью совпадает с ранее проверенной сборкой.\n\nТребования: Android 7.0+ и OpenGL ES 3.0. Интерфейс адаптируется к 4:3, 16:9 и широким экранам. Контрольная сумма: SHA256SUMS-Android.txt.\n'
+              p.write_text(body)
+          PY
+          gh release edit v1.0.1 --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md
+      - name: Remove the temporary transfer branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$STAGING_BRANCH"
